@@ -17,3 +17,7 @@ Release/
 *.tlog
 *.log
 *.obj
+*.bak
+finder.ico
+Finder.rc
+settings.ini
