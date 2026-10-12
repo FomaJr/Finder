@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,16 +23,69 @@ jobs:
           update: true
           install: >-
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-zlib
 
-      - name: Build
+      - name: Build Finder.exe
         shell: msys2 {0}
         run: |
-          g++ -std=c++17 -O2 -static -s -mwindows -municode Finder.cpp -o Finder.exe -lcomctl32 -lole32 -lshell32
+          g++ -std=c++17 -O2 -static -s -mwindows -municode Finder.cpp -o Finder.exe -lcomctl32 -lole32 -lshell32 -lz
+
+      - name: Download Poppler
+        shell: pwsh
+        run: |
+          $url = "https://github.com/oschwartz10612/poppler-windows/releases/download/v24.08.0-0/Release-24.08.0-0.zip"
+          $out = "$env:RUNNER_TEMP\poppler.zip"
+          Write-Host "Downloading Poppler from $url"
+          Invoke-WebRequest -Uri $url -OutFile $out
+          Write-Host "Extracting..."
+          Expand-Archive -Path $out -DestinationPath "$env:RUNNER_TEMP\poppler" -Force
+
+      - name: Assemble portable package
+        shell: pwsh
+        run: |
+          # Создаём папку для релиза
+          New-Item -ItemType Directory -Path "portable" -Force | Out-Null
+
+          # Копируем Finder.exe
+          Copy-Item "Finder.exe" "portable\"
+
+          # Ищем Library\bin в распакованном Poppler
+          $binDir = Get-ChildItem -Path "$env:RUNNER_TEMP\poppler" -Recurse -Directory |
+                    Where-Object { $_.FullName -like "*\Library\bin" } |
+                    Select-Object -First 1
+
+          if (-not $binDir) {
+            Write-Host "Не удалось найти Library\bin в архиве Poppler"
+            Get-ChildItem -Path "$env:RUNNER_TEMP\poppler" -Recurse -Directory |
+              Select-Object -First 20 FullName
+            exit 1
+          }
+
+          Write-Host "Копируем из $($binDir.FullName)"
+
+          # Копируем только pdftotext.exe и все DLL
+          Copy-Item "$($binDir.FullName)\pdftotext.exe" "portable\" -Force
+          Copy-Item "$($binDir.FullName)\*.dll" "portable\" -Force
+
+          # Скопируем README, LICENSE
+          Copy-Item "README.md" "portable\" -Force -ErrorAction SilentlyContinue
+          Copy-Item "LICENSE" "portable\" -Force -ErrorAction SilentlyContinue
+
+          # Смотрим, что получилось
+          Get-ChildItem "portable" | Select-Object Name, Length | Format-Table
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "portable\*" -DestinationPath "Finder-portable.zip" -Force
+          Get-Item "Finder-portable.zip" | Select-Object Name, Length
 
       - name: Create Release and Upload
         uses: softprops/action-gh-release@v2
         with:
-          files: Finder.exe
+          files: |
+            Finder-portable.zip
+            Finder.exe
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
