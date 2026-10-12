@@ -21,3 +21,8 @@ Release/
 finder.ico
 Finder.rc
 settings.ini
+*.dll 
+*.exe 
+pdf*.exe 
+Library/ 
+test_office/ 

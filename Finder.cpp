@@ -1,9 +1,8 @@
 ﻿// Finder.cpp
 // Сборка (MinGW):
-//   g++ -std=c++17 -O2 -static -s -mwindows -municode Finder.cpp -o Finder.exe -lcomctl32 -lole32 -lshell32
+//   g++ -std=c++17 -O2 -static -s -mwindows -municode Finder.cpp -o Finder.exe -lcomctl32 -lole32 -lshell32 -lz
 //
-// Сборка (MSVC):
-//   cl /std:c++17 /EHsc /O2 /utf-8 Finder.cpp /Fe:Finder.exe /link user32.lib gdi32.lib comctl32.lib ole32.lib shell32.lib
+// Рядом с Finder.exe должен лежать pdftotext.exe (Poppler) для поиска в PDF.
 
 #ifndef UNICODE
 #define UNICODE
@@ -13,16 +12,25 @@
 #endif
 
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <shlobj.h>
+#include <shellapi.h>
+#include <zlib.h>
+
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <regex>
 #include <string>
 #include <vector>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <algorithm>
 
 namespace fs = std::filesystem;
 
@@ -31,31 +39,467 @@ namespace fs = std::filesystem;
 #define ID_EDIT_PATTERN  103
 #define ID_CHK_MASK      104
 #define ID_CHK_ICASE     105
-#define ID_EDIT_EXT      106
-#define ID_BTN_SEARCH    107
-#define ID_EDIT_RESULTS  108
-#define ID_BTN_CLEAR     109
-#define ID_BTN_SAVE      110
-#define ID_PROGRESS      111
-#define ID_STATUS        112
+#define ID_BTN_SEARCH    106
+#define ID_EDIT_RESULTS  107
+#define ID_BTN_CLEAR     108
+#define ID_BTN_SAVE      109
+#define ID_PROGRESS      110
+#define ID_STATUS        111
 
-static HWND hPath, hBrowse, hPattern, hMask, hIcase, hExt,
+static HWND hPath, hBrowse, hPattern, hMask, hIcase,
             hSearch, hResults, hClear, hSave, hProgress, hStatus;
 static HFONT g_font;
 static std::atomic<bool> g_running{false};
 static std::atomic<bool> g_stop{false};
-static std::mutex g_appendMutex;
 
-// ---------- Структура результатов (для двойного клика) ----------
+static const uint64_t kMaxFileSize = 200ull * 1024 * 1024;
+
+// ---------- Расширения ----------
+static const std::vector<std::string> kExtensions = {
+    ".txt", ".log", ".md", ".ini", ".cfg", ".conf", ".json", ".xml",
+    ".yml", ".yaml", ".csv", ".tsv", ".tex", ".rtf",
+    ".cpp", ".c", ".h", ".hpp", ".cc", ".cxx", ".cs", ".java",
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".php", ".rb", ".go",
+    ".rs", ".lua", ".pl", ".sh", ".bat", ".cmd", ".ps1",
+    ".html", ".htm", ".css", ".scss", ".less", ".sql", ".vue",
+    ".kt", ".swift", ".m", ".mm", ".asm", ".s",
+    ".gradle", ".properties",
+    ".doc", ".xls", ".ppt",
+    ".docx", ".xlsx", ".pptx", ".docm", ".xlsm", ".pptm",
+    ".odt", ".ods", ".odp",
+    ".pdf"
+};
+
+static bool isZipOffice(const std::string& ext) {
+    return ext == ".docx" || ext == ".xlsx" || ext == ".pptx"
+        || ext == ".docm" || ext == ".xlsm" || ext == ".pptm"
+        || ext == ".odt"  || ext == ".ods"  || ext == ".odp";
+}
+
+// ---------- Результаты ----------
 struct ResultLine {
-    int lineIndex;        // индекс строки в EDIT (0-based)
+    int lineIndex;
     std::wstring filePath;
-    int fileLine;         // номер строки в файле
+    int fileLine;
 };
 static std::vector<ResultLine> g_resultLines;
 static std::mutex g_resultMutex;
+static std::mutex g_appendMutex;
 
-// ---------- Путь к .ini с настройками ----------
+// ==================== Утилиты путей ====================
+
+static std::string PathToUtf8(const fs::path& p) {
+    auto u8 = p.u8string();
+    return std::string(u8.begin(), u8.end());
+}
+
+static fs::path ExeDir() {
+    wchar_t buf[MAX_PATH];
+    GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    return fs::path(buf).parent_path();
+}
+
+// ==================== ZIP ====================
+
+static uint32_t ReadU32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint16_t ReadU16(const uint8_t* p) {
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+static bool InflateRaw(const uint8_t* in, size_t inLen, std::string& out) {
+    if (inLen == 0) return true;
+    z_stream zs;
+    std::memset(&zs, 0, sizeof(zs));
+    if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) return false;
+    zs.next_in = const_cast<Bytef*>(in);
+    zs.avail_in = (uInt)inLen;
+    const size_t chunk = 65536;
+    std::vector<char> buf(chunk);
+    int ret;
+    do {
+        zs.next_out = (Bytef*)buf.data();
+        zs.avail_out = (uInt)chunk;
+        ret = inflate(&zs, Z_NO_FLUSH);
+        if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) {
+            inflateEnd(&zs); return false;
+        }
+        size_t have = chunk - zs.avail_out;
+        out.append(buf.data(), have);
+        if (out.size() > 500ull * 1024 * 1024) { inflateEnd(&zs); return false; }
+    } while (ret != Z_STREAM_END && zs.avail_in > 0);
+    inflateEnd(&zs);
+    return true;
+}
+
+static bool ReadFileAll(const fs::path& path, std::string& data) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    in.seekg(0, std::ios::end);
+    std::streamoff sz = in.tellg();
+    if (sz <= 0) return false;
+    in.seekg(0, std::ios::beg);
+    data.resize((size_t)sz);
+    in.read(data.data(), sz);
+    return in.good() || in.eof();
+}
+
+static bool ZipExtract(const fs::path& zipPath, const std::string& wantName,
+                       std::string& out)
+{
+    std::string data;
+    if (!ReadFileAll(zipPath, data)) return false;
+    const uint8_t* dp = (const uint8_t*)data.data();
+    if (data.size() < 22) return false;
+
+    size_t eocdPos = std::string::npos;
+    for (size_t i = data.size() - 22; ; --i) {
+        if (data[i] == 0x50 && data[i+1] == 0x4b &&
+            data[i+2] == 0x05 && data[i+3] == 0x06) { eocdPos = i; break; }
+        if (i == 0) break;
+    }
+    if (eocdPos == std::string::npos) return false;
+
+    uint32_t cdOffset = ReadU32(&dp[eocdPos + 16]);
+    uint16_t cdCount  = ReadU16(&dp[eocdPos + 10]);
+
+    size_t p = cdOffset;
+    for (uint16_t n = 0; n < cdCount && p + 46 <= data.size(); ++n) {
+        if (!(data[p] == 0x50 && data[p+1] == 0x4b &&
+              data[p+2] == 0x01 && data[p+3] == 0x02)) break;
+
+        uint16_t method   = ReadU16(&dp[p + 10]);
+        uint32_t compSize = ReadU32(&dp[p + 20]);
+        uint16_t nameLen  = ReadU16(&dp[p + 28]);
+        uint16_t extraLen = ReadU16(&dp[p + 30]);
+        uint16_t commLen  = ReadU16(&dp[p + 32]);
+        uint32_t localOff = ReadU32(&dp[p + 42]);
+
+        std::string name((char*)&dp[p + 46], nameLen);
+
+        if (name == wantName) {
+            size_t lp = localOff;
+            if (lp + 30 > data.size()) return false;
+            uint16_t lNameLen  = ReadU16(&dp[lp + 26]);
+            uint16_t lExtraLen = ReadU16(&dp[lp + 28]);
+            size_t dataStart = lp + 30 + lNameLen + lExtraLen;
+            if (dataStart + compSize > data.size()) return false;
+            if (method == 0) {
+                out.assign((char*)&dp[dataStart], compSize);
+                return true;
+            } else if (method == 8) {
+                return InflateRaw(&dp[dataStart], compSize, out);
+            } else {
+                return false;
+            }
+        }
+        p += 46 + nameLen + extraLen + commLen;
+    }
+    return false;
+}
+
+// ==================== XML -> plain text ====================
+
+static void DecodeXmlEntities(std::string& s) {
+    struct { const char* from; const char* to; } map[] = {
+        {"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"},
+        {"&quot;", "\""}, {"&apos;", "'"}, {"&nbsp;", " "},
+    };
+    for (auto& m : map) {
+        size_t pos = 0;
+        while ((pos = s.find(m.from, pos)) != std::string::npos) {
+            s.replace(pos, std::strlen(m.from), m.to);
+            pos += std::strlen(m.to);
+        }
+    }
+    static const std::regex numEnt(R"(&#(x?[0-9A-Fa-f]+);)");
+    std::string result;
+    result.reserve(s.size());
+    auto begin = std::sregex_iterator(s.begin(), s.end(), numEnt);
+    auto end   = std::sregex_iterator();
+    size_t last = 0;
+    for (auto it = begin; it != end; ++it) {
+        result.append(s, last, it->position() - last);
+        std::string num = (*it)[1].str();
+        long code = 0;
+        try {
+            if (!num.empty() && (num[0]=='x' || num[0]=='X'))
+                code = std::stol(num.substr(1), nullptr, 16);
+            else
+                code = std::stol(num, nullptr, 10);
+        } catch (...) { code = '?'; }
+        if (code < 0x80) {
+            result += (char)code;
+        } else if (code < 0x800) {
+            result += (char)(0xC0 | (code >> 6));
+            result += (char)(0x80 | (code & 0x3F));
+        } else if (code < 0x10000) {
+            result += (char)(0xE0 | (code >> 12));
+            result += (char)(0x80 | ((code >> 6) & 0x3F));
+            result += (char)(0x80 | (code & 0x3F));
+        } else {
+            result += (char)(0xF0 | (code >> 18));
+            result += (char)(0x80 | ((code >> 12) & 0x3F));
+            result += (char)(0x80 | ((code >> 6) & 0x3F));
+            result += (char)(0x80 | (code & 0x3F));
+        }
+        last = it->position() + it->length();
+    }
+    result.append(s, last, std::string::npos);
+    s = std::move(result);
+}
+
+static std::string XmlToText(const std::string& xml) {
+    std::string s;
+    s.reserve(xml.size());
+    bool inTag = false;
+    for (size_t i = 0; i < xml.size(); ++i) {
+        char c = xml[i];
+        if (c == '<') { inTag = true; s += ' '; continue; }
+        if (c == '>') { inTag = false; s += ' '; continue; }
+        if (!inTag) s += c;
+    }
+    DecodeXmlEntities(s);
+    return s;
+}
+
+// ==================== DOCX / XLSX / PPTX / ODT ====================
+
+static bool ExtractOfficeText(const fs::path& path, const std::string& ext,
+                              std::string& out)
+{
+    out.clear();
+    if (ext == ".docx" || ext == ".docm") {
+        std::string xml;
+        if (ZipExtract(path, "word/document.xml", xml))
+            out = XmlToText(xml);
+        return !out.empty();
+    }
+    if (ext == ".xlsx" || ext == ".xlsm") {
+        std::string a;
+        std::string shared;
+        if (ZipExtract(path, "xl/sharedStrings.xml", a))
+            shared = XmlToText(a);
+        std::string allSheets;
+        for (int i = 1; i <= 20; ++i) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "xl/worksheets/sheet%d.xml", i);
+            std::string s;
+            if (!ZipExtract(path, buf, s)) break;
+            allSheets += XmlToText(s);
+            allSheets += "\n";
+        }
+        out = shared + "\n" + allSheets;
+        return !out.empty();
+    }
+    if (ext == ".pptx" || ext == ".pptm") {
+        std::string all;
+        for (int i = 1; i <= 100; ++i) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "ppt/slides/slide%d.xml", i);
+            std::string s;
+            if (!ZipExtract(path, buf, s)) break;
+            all += XmlToText(s);
+            all += "\n";
+        }
+        out = all;
+        return !out.empty();
+    }
+    if (ext == ".odt" || ext == ".ods" || ext == ".odp") {
+        std::string xml;
+        if (ZipExtract(path, "content.xml", xml))
+            out = XmlToText(xml);
+        return !out.empty();
+    }
+    return false;
+}
+
+// ==================== PDF ====================
+
+static std::string ExtractTextFromContentStream(const std::string& content) {
+    std::string out;
+    out.reserve(content.size() / 2);
+    bool inText = false;
+    size_t i = 0;
+    const size_t n = content.size();
+
+    while (i < n) {
+        if (i + 1 < n && content[i] == 'B' && content[i+1] == 'T') {
+            inText = true; i += 2; continue;
+        }
+        if (i + 1 < n && content[i] == 'E' && content[i+1] == 'T') {
+            inText = false; out += ' '; i += 2; continue;
+        }
+        if (!inText) { ++i; continue; }
+        char c = content[i];
+        if (c == '(') {
+            ++i;
+            int depth = 1;
+            std::string s;
+            while (i < n && depth > 0) {
+                char ch = content[i++];
+                if (ch == '\\' && i < n) {
+                    char esc = content[i++];
+                    switch (esc) {
+                        case 'n': s += '\n'; break;
+                        case 'r': s += '\r'; break;
+                        case 't': s += '\t'; break;
+                        case '(': s += '('; break;
+                        case ')': s += ')'; break;
+                        case '\\': s += '\\'; break;
+                        default:
+                            if (esc >= '0' && esc <= '7') {
+                                int val = esc - '0';
+                                for (int k = 0; k < 2 && i < n &&
+                                                content[i] >= '0' && content[i] <= '7'; ++k)
+                                    val = val * 8 + (content[i++] - '0');
+                                s += (char)val;
+                            } else s += esc;
+                    }
+                } else if (ch == '(') { ++depth; s += ch; }
+                else if (ch == ')') { --depth; if (depth > 0) s += ch; }
+                else s += ch;
+            }
+            out += s;
+            out += ' ';
+            continue;
+        }
+        if (c == '<' && i + 1 < n && content[i+1] != '<') {
+            ++i;
+            while (i < n && content[i] != '>') ++i;
+            if (i < n) ++i;
+            out += ' ';
+            continue;
+        }
+        ++i;
+    }
+    return out;
+}
+
+static bool ExtractPdfTextFallback(const fs::path& path, std::string& out) {
+    std::string data;
+    if (!ReadFileAll(path, data)) return false;
+    if (data.size() < 8 || data.compare(0, 5, "%PDF-") != 0) return false;
+    out.clear();
+    size_t pos = 0;
+    const size_t n = data.size();
+    while (pos < n) {
+        size_t sPos = data.find("stream", pos);
+        if (sPos == std::string::npos) break;
+        size_t dataStart = sPos + 6;
+        if (dataStart < n && data[dataStart] == '\r') ++dataStart;
+        if (dataStart < n && data[dataStart] == '\n') ++dataStart;
+        size_t ePos = data.find("endstream", dataStart);
+        if (ePos == std::string::npos) break;
+        size_t dataEnd = ePos;
+        while (dataEnd > dataStart &&
+               (data[dataEnd-1]=='\r' || data[dataEnd-1]=='\n')) --dataEnd;
+        size_t lookBack = (sPos > 200) ? sPos - 200 : 0;
+        std::string dict(data, lookBack, sPos - lookBack);
+        bool isFlate = dict.find("FlateDecode") != std::string::npos;
+        std::string decoded;
+        if (isFlate) {
+            if (!InflateRaw((const uint8_t*)data.data() + dataStart,
+                            dataEnd - dataStart, decoded)) {
+                pos = ePos + 9; continue;
+            }
+        } else {
+            decoded.assign(data, dataStart, dataEnd - dataStart);
+        }
+        if (decoded.find("BT") != std::string::npos &&
+            decoded.find("ET") != std::string::npos) {
+            out += ExtractTextFromContentStream(decoded);
+            out += '\n';
+        }
+        pos = ePos + 9;
+    }
+    return !out.empty();
+}
+
+// Запуск pdftotext.exe с перехватом stdout
+static bool RunPdftotext(const fs::path& pdftotextExe,
+                         const fs::path& pdfPath,
+                         std::string& out)
+{
+    out.clear();
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE hRead = nullptr, hWrite = nullptr;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return false;
+    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+    std::wstring cmd = L"\"" + pdftotextExe.wstring() + L"\" -enc UTF-8 -layout \""
+                     + pdfPath.wstring() + L"\" -";
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = hWrite;
+    si.hStdError  = hWrite;
+    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+
+    PROCESS_INFORMATION pi = {};
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+
+    BOOL ok = CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, TRUE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(hWrite);
+    if (!ok) { CloseHandle(hRead); return false; }
+
+    char buf[8192];
+    DWORD read = 0;
+    while (ReadFile(hRead, buf, sizeof(buf), &read, nullptr) && read > 0) {
+        out.append(buf, read);
+    }
+
+    WaitForSingleObject(pi.hProcess, 30000);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    CloseHandle(hRead);
+    return !out.empty();
+}
+
+static bool ExtractPdfText(const fs::path& path, std::string& out) {
+    fs::path exeDir = ExeDir();
+    fs::path candidates[] = {
+        exeDir / L"pdftotext.exe",
+        exeDir / L"bin" / L"pdftotext.exe",
+    };
+    for (auto& cand : candidates) {
+        std::error_code ec;
+        if (fs::exists(cand, ec)) {
+            if (RunPdftotext(cand, path, out) && !out.empty()) return true;
+        }
+    }
+    return ExtractPdfTextFallback(path, out);
+}
+
+// ==================== Общая точка извлечения ====================
+
+static std::string ExtractFileText(const fs::path& path,
+                                   const std::string& extLower)
+{
+    if (isZipOffice(extLower)) {
+        std::string txt;
+        ExtractOfficeText(path, extLower, txt);
+        return txt;
+    }
+    if (extLower == ".pdf") {
+        std::string txt;
+        ExtractPdfText(path, txt);
+        return txt;
+    }
+    std::string data;
+    if (!ReadFileAll(path, data)) return "";
+    return data;
+}
+
+// ==================== Настройки ====================
+
 static std::wstring GetIniPath() {
     wchar_t buf[MAX_PATH];
     GetModuleFileNameW(nullptr, buf, MAX_PATH);
@@ -66,13 +510,11 @@ static std::wstring GetIniPath() {
 
 static void SaveSettings() {
     std::wstring ini = GetIniPath();
-    wchar_t path[MAX_PATH] = {}, pat[512] = {}, ext[512] = {};
+    wchar_t path[MAX_PATH] = {}, pat[512] = {};
     GetWindowTextW(hPath, path, MAX_PATH);
     GetWindowTextW(hPattern, pat, 512);
-    GetWindowTextW(hExt, ext, 512);
     WritePrivateProfileStringW(L"general", L"path", path, ini.c_str());
     WritePrivateProfileStringW(L"general", L"pattern", pat, ini.c_str());
-    WritePrivateProfileStringW(L"general", L"ext", ext, ini.c_str());
     WritePrivateProfileStringW(L"general", L"mask",
         SendMessageW(hMask, BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"general", L"icase",
@@ -81,21 +523,24 @@ static void SaveSettings() {
 
 static void LoadSettings() {
     std::wstring ini = GetIniPath();
-    if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        SetWindowTextW(hPath, L"G:\\PAN\\Finder\\Finder");
+        return;
+    }
     wchar_t buf[1024];
-    GetPrivateProfileStringW(L"general", L"path", L"G:\\PAN\\Finder\\Finder", buf, 1024, ini.c_str());
+    GetPrivateProfileStringW(L"general", L"path", L"G:\\PAN\\Finder\\Finder",
+                             buf, 1024, ini.c_str());
     SetWindowTextW(hPath, buf);
     GetPrivateProfileStringW(L"general", L"pattern", L"", buf, 1024, ini.c_str());
     SetWindowTextW(hPattern, buf);
-    GetPrivateProfileStringW(L"general", L"ext", L"", buf, 1024, ini.c_str());
-    SetWindowTextW(hExt, buf);
     int m = GetPrivateProfileIntW(L"general", L"mask", 0, ini.c_str());
     SendMessageW(hMask, BM_SETCHECK, m ? BST_CHECKED : BST_UNCHECKED, 0);
     int ic = GetPrivateProfileIntW(L"general", L"icase", 0, ini.c_str());
     SendMessageW(hIcase, BM_SETCHECK, ic ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
-// ---------- Утилиты ----------
+// ==================== Утилиты ====================
+
 static std::string toLower(std::string s) {
     for (auto& c : s) c = (char)std::tolower((unsigned char)c);
     return s;
@@ -131,30 +576,32 @@ static bool matchesMask(const std::string& line, const std::string& reStr, bool 
     } catch (...) { return false; }
 }
 
-static bool hasAllowedExt(const fs::path& p, const std::vector<std::string>& exts) {
-    if (exts.empty()) return true;
-    std::string e = toLower(p.extension().string());
-    for (auto& x : exts) if (e == toLower(x)) return true;
+static bool hasAllowedExt(const fs::path& p) {
+    std::string e = toLower(PathToUtf8(p.extension()));
+    for (auto& x : kExtensions) if (e == x) return true;
     return false;
 }
 
-static std::vector<fs::path> collectFiles(const fs::path& root,
-                                          const std::vector<std::string>& exts) {
+static std::vector<fs::path> collectFiles(const fs::path& root) {
     std::vector<fs::path> out;
     std::error_code ec;
-    if (fs::is_regular_file(root, ec)) { out.push_back(root); return out; }
+    if (fs::is_regular_file(root, ec)) {
+        if (hasAllowedExt(root)) out.push_back(root);
+        return out;
+    }
     if (!fs::is_directory(root, ec)) return out;
     for (auto it = fs::recursive_directory_iterator(
              root, fs::directory_options::skip_permission_denied, ec);
          it != fs::recursive_directory_iterator(); it.increment(ec)) {
         if (ec) { ec.clear(); continue; }
-        if (it->is_regular_file(ec) && hasAllowedExt(it->path(), exts))
+        if (it->is_regular_file(ec) && hasAllowedExt(it->path()))
             out.push_back(it->path());
     }
     return out;
 }
 
-// ---------- UTF-8 <-> wide ----------
+// ==================== UTF-8 <-> wide ====================
+
 static std::wstring Utf8ToWide(const std::string& s) {
     if (s.empty()) return L"";
     int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
@@ -162,6 +609,7 @@ static std::wstring Utf8ToWide(const std::string& s) {
     MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
     return w;
 }
+
 static std::string WideToUtf8(const std::wstring& w) {
     if (w.empty()) return "";
     int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
@@ -171,6 +619,7 @@ static std::string WideToUtf8(const std::wstring& w) {
                         s.data(), n, nullptr, nullptr);
     return s;
 }
+
 static std::wstring GetText(HWND h) {
     int len = GetWindowTextLengthW(h);
     std::wstring s(len, L'\0');
@@ -178,7 +627,8 @@ static std::wstring GetText(HWND h) {
     return s;
 }
 
-// ---------- Вывод результатов (с сохранением карты строк) ----------
+// ==================== Вывод результатов ====================
+
 static void AppendResults(const std::wstring& text) {
     std::lock_guard<std::mutex> lk(g_appendMutex);
     int len = GetWindowTextLengthW(hResults);
@@ -187,15 +637,16 @@ static void AppendResults(const std::wstring& text) {
 }
 
 static void AppendResultFileLine(const std::wstring& filePath, int fileLine,
-                                 const std::wstring& lineText) {
+                                 const std::wstring& lineText)
+{
     std::lock_guard<std::mutex> lk(g_appendMutex);
     int len = GetWindowTextLengthW(hResults);
-    // Запоминаем, на какой визуальной строке начнётся эта запись
-    int lineIndex = (int)SendMessageW(hResults, EM_LINEFROMCHAR, len, 0);
-    // Добавляем перевод строки, если в конце текста не было \r\n
+    int lineIndex = (int)SendMessageW(hResults, EM_LINEFROMCHAR, (WPARAM)len, 0);
+
     std::wstring toAdd;
     if (len > 0) toAdd += L"\r\n";
     toAdd += std::to_wstring(fileLine) + L": " + lineText;
+
     SendMessageW(hResults, EM_SETSEL, len, len);
     SendMessageW(hResults, EM_REPLACESEL, FALSE, (LPARAM)toAdd.c_str());
 
@@ -203,23 +654,53 @@ static void AppendResultFileLine(const std::wstring& filePath, int fileLine,
     rl.lineIndex = lineIndex;
     rl.filePath  = filePath;
     rl.fileLine  = fileLine;
-    std::lock_guard<std::mutex> lk2(g_resultMutex);
-    g_resultLines.push_back(rl);
+    {
+        std::lock_guard<std::mutex> lk2(g_resultMutex);
+        g_resultLines.push_back(rl);
+    }
 }
 
 static void UpdateStatus(const std::wstring& s) {
     SetWindowTextW(hStatus, s.c_str());
 }
 
-// ---------- Фоновый поиск ----------
-static void RunSearch(std::wstring wpath, std::wstring wpattern,
-                      bool useMask, bool icase, std::vector<std::string> exts)
+// ==================== Фоновый поиск ====================
+
+static void SearchInText(const std::string& content,
+                         const std::wstring& fname,
+                         const std::string& pattern,
+                         const std::string& reStr,
+                         bool useMask, bool icase,
+                         bool& headerPrinted, int& matchedThisFile)
 {
-    std::string path    = WideToUtf8(wpath);
+    std::istringstream iss(content);
+    std::string line;
+    int lineno = 0;
+    while (std::getline(iss, line)) {
+        if (g_stop) break;
+        ++lineno;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        bool hit = useMask ? matchesMask(line, reStr, icase)
+                           : contains(line, pattern, icase);
+        if (hit) {
+            if (!headerPrinted) {
+                AppendResults(L"\r\n=== " + fname + L" ===\r\n");
+                headerPrinted = true;
+                matchedThisFile = 1;
+            }
+            AppendResultFileLine(fname, lineno, Utf8ToWide(line));
+        }
+    }
+}
+
+static void RunSearch(std::wstring wpath, std::wstring wpattern,
+                      bool useMask, bool icase)
+{
+    fs::path root = wpath;
     std::string pattern = WideToUtf8(wpattern);
 
     std::error_code ec;
-    if (!fs::exists(path, ec)) {
+    if (!fs::exists(root, ec)) {
         UpdateStatus(L"Путь не найден.");
         g_running = false;
         EnableWindow(hSearch, TRUE);
@@ -227,16 +708,13 @@ static void RunSearch(std::wstring wpath, std::wstring wpattern,
     }
 
     std::string reStr = useMask ? globToRegex(pattern) : "";
-    auto files = collectFiles(path, exts);
+    auto files = collectFiles(root);
 
-    // Прогресс-бар
-    SendMessageW(hProgress, PBM_SETRANGE, 0, MAKELPARAM(0, (int)files.size()));
-    SendMessageW(hProgress, PBM_SETPOS, 0, 0);
+    PostMessageW(hProgress, PBM_SETRANGE, 0, MAKELPARAM(0, (int)files.size()));
 
     int matchedFiles = 0;
     int current = 0;
 
-    // Очищаем карту строк результатов
     {
         std::lock_guard<std::mutex> lk(g_resultMutex);
         g_resultLines.clear();
@@ -246,39 +724,32 @@ static void RunSearch(std::wstring wpath, std::wstring wpattern,
         if (g_stop) break;
         ++current;
 
-        // обновляем прогресс каждые 50 файлов или на последнем
-        if (current % 50 == 0 || current == (int)files.size()) {
-            SendMessageW(hProgress, PBM_SETPOS, current, 0);
-            UpdateStatus(L"Поиск: " + std::to_wstring(current) +
-                         L" из " + std::to_wstring(files.size()) + L" файлов");
+        if (current % 25 == 0 || current == (int)files.size()) {
+            PostMessageW(hProgress, PBM_SETPOS, current, 0);
+            std::wstring s = L"Поиск: " + std::to_wstring(current) +
+                             L" из " + std::to_wstring(files.size()) + L" файлов";
+            UpdateStatus(s);
         }
 
-        std::ifstream in(f, std::ios::binary);
-        if (!in) continue;
+        std::error_code ec2;
+        auto sz = fs::file_size(f, ec2);
+        if (!ec2 && sz > kMaxFileSize) continue;
 
-        std::string line;
-        int lineno = 0;
+        std::string extLower = toLower(PathToUtf8(f.extension()));
+        std::string content = ExtractFileText(f, extLower);
+        if (content.empty()) continue;
+
+        std::wstring fname = Utf8ToWide(PathToUtf8(f));
         bool headerPrinted = false;
-        std::wstring fname = Utf8ToWide(f.string());
+        int matchedThisFile = 0;
 
-        while (std::getline(in, line)) {
-            if (g_stop) break;
-            ++lineno;
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            bool hit = useMask ? matchesMask(line, reStr, icase)
-                               : contains(line, pattern, icase);
-            if (hit) {
-                if (!headerPrinted) {
-                    AppendResults(L"\r\n=== " + fname + L" ===\r\n");
-                    headerPrinted = true;
-                }
-                AppendResultFileLine(fname, lineno, Utf8ToWide(line));
-            }
-        }
-        if (headerPrinted) ++matchedFiles;
+        SearchInText(content, fname, pattern, reStr,
+                     useMask, icase, headerPrinted, matchedThisFile);
+
+        if (matchedThisFile) ++matchedFiles;
     }
 
-    SendMessageW(hProgress, PBM_SETPOS, (int)files.size(), 0);
+    PostMessageW(hProgress, PBM_SETPOS, (int)files.size(), 0);
     AppendResults(L"\r\nФайлов с совпадениями: " +
                   std::to_wstring(matchedFiles) + L"\r\n");
     UpdateStatus(L"Готово. Найдено файлов: " + std::to_wstring(matchedFiles));
@@ -287,14 +758,14 @@ static void RunSearch(std::wstring wpath, std::wstring wpattern,
     EnableWindow(hSearch, TRUE);
 }
 
-// ---------- Сохранить результаты в .txt ----------
+// ==================== Сохранить результаты ====================
+
 static void SaveResultsToFile(HWND hwnd) {
     int len = GetWindowTextLengthW(hResults);
     if (len == 0) {
         MessageBoxW(hwnd, L"Результатов нет.", L"Сохранить", MB_ICONINFORMATION);
         return;
     }
-
     wchar_t file[MAX_PATH] = L"results.txt";
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
@@ -304,30 +775,29 @@ static void SaveResultsToFile(HWND hwnd) {
     ofn.nMaxFile    = MAX_PATH;
     ofn.lpstrDefExt = L"txt";
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-
     if (!GetSaveFileNameW(&ofn)) return;
 
     std::wstring content(len + 1, L'\0');
     GetWindowTextW(hResults, content.data(), len + 1);
     content.resize(len);
 
-    std::ofstream out(file, std::ios::binary);
+    std::ofstream out(fs::path(file), std::ios::binary);
     if (!out) {
         MessageBoxW(hwnd, L"Не удалось сохранить файл.", L"Ошибка", MB_ICONERROR);
         return;
     }
     std::string utf8 = WideToUtf8(content);
-    // BOM UTF-8, чтобы Блокнот понял кодировку
     out.write("\xEF\xBB\xBF", 3);
     out.write(utf8.data(), (std::streamsize)utf8.size());
     MessageBoxW(hwnd, L"Сохранено.", L"OK", MB_ICONINFORMATION);
 }
 
-// ---------- Двойной клик: открыть файл ----------
+// ==================== Открыть файл по двойному клику ====================
+
 static void OpenResultLine(HWND hwnd) {
     DWORD sel = (DWORD)SendMessageW(hResults, EM_GETSEL, 0, 0);
-    int clickedLine = (int)SendMessageW(hResults, EM_LINEFROMCHAR, (WPARAM)LOWORD(sel), 0);
-
+    int clickedLine = (int)SendMessageW(hResults, EM_LINEFROMCHAR,
+                                        (WPARAM)LOWORD(sel), 0);
     std::wstring filePath;
     int fileLine = 0;
     {
@@ -341,46 +811,79 @@ static void OpenResultLine(HWND hwnd) {
     }
     if (filePath.empty()) return;
 
-    // Пробуем VS Code
-    std::wstring cmd = L"code -g \"" + filePath + L":" + std::to_wstring(fileLine) + L"\"";
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi = {};
-    std::wstring cmdMutable = cmd;
-    if (CreateProcessW(nullptr, cmdMutable.data(), nullptr, nullptr, FALSE,
-                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+    // Определяем расширение (в нижнем регистре)
+    std::wstring ext;
+    size_t dot = filePath.find_last_of(L'.');
+    if (dot != std::wstring::npos) {
+        ext = filePath.substr(dot);
+        for (auto& c : ext) c = (wchar_t)towlower(c);
+    }
+
+    // Документы — открываем ассоциированным приложением
+    bool isDocument =
+        ext == L".docx" || ext == L".doc"  || ext == L".rtf" ||
+        ext == L".odt"  || ext == L".xlsx" || ext == L".xls" ||
+        ext == L".ods"  || ext == L".pptx" || ext == L".ppt" ||
+        ext == L".odp"  || ext == L".pdf";
+
+    if (isDocument) {
+        ShellExecuteW(nullptr, L"open", filePath.c_str(),
+                      nullptr, nullptr, SW_SHOWNORMAL);
         return;
     }
 
-    // Если VS Code нет — пробуем Notepad
-    std::wstring cmd2 = L"notepad \"" + filePath + L"\"";
-    std::wstring cmd2Mutable = cmd2;
-    STARTUPINFOW si2 = { sizeof(si2) };
-    PROCESS_INFORMATION pi2 = {};
-    CreateProcessW(nullptr, cmd2Mutable.data(), nullptr, nullptr, FALSE,
-                   CREATE_NO_WINDOW, nullptr, nullptr, &si2, &pi2);
-    if (pi2.hProcess) CloseHandle(pi2.hProcess);
-    if (pi2.hThread)  CloseHandle(pi2.hThread);
-}
-
-// ---------- Правый клик: контекстное меню ----------
-static void ShowResultsContextMenu(HWND hwnd, int x, int y) {
-    HMENU hMenu = CreatePopupMenu();
-    AppendMenuW(hMenu, MF_STRING, 1, L"Копировать");
-    AppendMenuW(hMenu, MF_STRING, 2, L"Открыть файл (двойной клик)");
-    int cmd = (int)TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                                  x, y, 0, hwnd, nullptr);
-    DestroyMenu(hMenu);
-
-    if (cmd == 1) {
-        SendMessageW(hResults, WM_COPY, 0, 0);
-    } else if (cmd == 2) {
-        OpenResultLine(hwnd);
+    // Текстовые — всегда Блокнот
+    std::wstring cmd = L"notepad.exe \"" + filePath + L"\"";
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {};
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+    if (CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
     }
 }
 
-// ---------- Окно ----------
+// ==================== Контекстное меню ====================
+
+static void ShowResultsContextMenu(HWND hwnd, int x, int y) {
+    HMENU hMenu = CreatePopupMenu();
+    AppendMenuW(hMenu, MF_STRING, 1, L"Копировать");
+    AppendMenuW(hMenu, MF_STRING, 2, L"Открыть файл");
+    int cmd = (int)TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                  x, y, 0, hwnd, nullptr);
+    DestroyMenu(hMenu);
+    if (cmd == 1) SendMessageW(hResults, WM_COPY, 0, 0);
+    else if (cmd == 2) OpenResultLine(hwnd);
+}
+
+// ==================== Подкласс поля результатов ====================
+
+static LRESULT CALLBACK ResultsSubclassProc(HWND hwnd, UINT msg,
+                                            WPARAM wp, LPARAM lp,
+                                            UINT_PTR /*id*/, DWORD_PTR /*ref*/)
+{
+    if (msg == WM_LBUTTONDBLCLK) {
+        OpenResultLine(GetParent(hwnd));
+        return 0;
+    }
+    if (msg == WM_CONTEXTMENU) {
+        int x = GET_X_LPARAM(lp);
+        int y = GET_Y_LPARAM(lp);
+        if (x == -1 && y == -1) {
+            POINT pt;
+            GetCursorPos(&pt);
+            x = pt.x; y = pt.y;
+        }
+        ShowResultsContextMenu(GetParent(hwnd), x, y);
+        return 0;
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+// ==================== Окно ====================
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -410,36 +913,31 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                       WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 280, 72, 180, 22,
                       hwnd, (HMENU)ID_CHK_ICASE, nullptr, nullptr);
 
-        CreateWindowW(L"STATIC", L"Расширения (.txt,.py):",
-                      WS_CHILD | WS_VISIBLE, 10, 100, 160, 20,
-                      hwnd, nullptr, nullptr, nullptr);
-        hExt = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                      WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 175, 98, 405, 24,
-                      hwnd, (HMENU)ID_EDIT_EXT, nullptr, nullptr);
-
         hSearch = CreateWindowW(L"BUTTON", L"Найти",
-                      WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 130, 132, 100, 28,
+                      WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 130, 102, 100, 28,
                       hwnd, (HMENU)ID_BTN_SEARCH, nullptr, nullptr);
         hClear  = CreateWindowW(L"BUTTON", L"Очистить",
-                      WS_CHILD | WS_VISIBLE, 240, 132, 100, 28,
+                      WS_CHILD | WS_VISIBLE, 240, 102, 100, 28,
                       hwnd, (HMENU)ID_BTN_CLEAR, nullptr, nullptr);
         hSave   = CreateWindowW(L"BUTTON", L"Сохранить в .txt",
-                      WS_CHILD | WS_VISIBLE, 350, 132, 140, 28,
+                      WS_CHILD | WS_VISIBLE, 350, 102, 140, 28,
                       hwnd, (HMENU)ID_BTN_SAVE, nullptr, nullptr);
 
         hProgress = CreateWindowExW(0, PROGRESS_CLASSW, nullptr,
-                      WS_CHILD | WS_VISIBLE, 10, 168, 670, 18,
+                      WS_CHILD | WS_VISIBLE, 10, 138, 670, 18,
                       hwnd, (HMENU)ID_PROGRESS, nullptr, nullptr);
 
         hStatus = CreateWindowW(L"STATIC", L"Готов.",
-                      WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 190, 670, 20,
+                      WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 160, 670, 20,
                       hwnd, (HMENU)ID_STATUS, nullptr, nullptr);
 
         hResults = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                       WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
                       ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-                      10, 214, 670, 300,
+                      10, 184, 670, 300,
                       hwnd, (HMENU)ID_EDIT_RESULTS, nullptr, nullptr);
+
+        SetWindowSubclass(hResults, ResultsSubclassProc, 1, 0);
 
         EnumChildWindows(hwnd, [](HWND h, LPARAM p) -> BOOL {
             SendMessageW(h, WM_SETFONT, (WPARAM)p, TRUE);
@@ -454,14 +952,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT r; GetClientRect(hwnd, &r);
         int w = r.right - r.left;
         int h = r.bottom - r.top;
-        MoveWindow(hProgress, 10, 168, w - 20, 18, TRUE);
-        MoveWindow(hStatus,   10, 190, w - 20, 20, TRUE);
-        MoveWindow(hResults,  10, 214, w - 20, h - 224, TRUE);
+        MoveWindow(hProgress, 10, 138, w - 20, 18, TRUE);
+        MoveWindow(hStatus,   10, 160, w - 20, 20, TRUE);
+        MoveWindow(hResults,  10, 184, w - 20, h - 194, TRUE);
         return 0;
     }
 
     case WM_CTLCOLORSTATIC: {
-        // фон статиков как у окна
         HDC hdc = (HDC)wp;
         SetBkMode(hdc, TRANSPARENT);
         return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
@@ -470,7 +967,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND: {
         int id = LOWORD(wp);
         int code = HIWORD(wp);
-
         if (id == ID_EDIT_RESULTS && code == EN_ERRSPACE) return 0;
 
         if (id == ID_BTN_BROWSE) {
@@ -499,35 +995,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         else if (id == ID_BTN_SEARCH) {
             if (g_running) return 0;
-
             std::wstring path = GetText(hPath);
             std::wstring pat  = GetText(hPattern);
-            std::wstring extS = GetText(hExt);
-
             if (path.empty() || pat.empty()) {
                 MessageBoxW(hwnd, L"Заполните путь и что искать.",
                             L"Ошибка", MB_ICONWARNING);
                 return 0;
             }
-
             bool useMask = SendMessageW(hMask, BM_GETCHECK, 0, 0) == BST_CHECKED;
             bool icase   = SendMessageW(hIcase, BM_GETCHECK, 0, 0) == BST_CHECKED;
-
-            std::vector<std::string> exts;
-            std::string extUtf8 = WideToUtf8(extS);
-            size_t start = 0;
-            while (start <= extUtf8.size()) {
-                size_t comma = extUtf8.find(',', start);
-                std::string e = extUtf8.substr(start, comma - start);
-                while (!e.empty() && (e.front()==' '||e.front()=='\t')) e.erase(e.begin());
-                while (!e.empty() && (e.back() ==' '||e.back() =='\t')) e.pop_back();
-                if (!e.empty()) {
-                    if (e[0] != '.') e = "." + e;
-                    exts.push_back(e);
-                }
-                if (comma == std::string::npos) break;
-                start = comma + 1;
-            }
 
             SetWindowTextW(hResults, L"");
             {
@@ -542,20 +1018,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             EnableWindow(hSearch, FALSE);
             SaveSettings();
 
-            std::thread(RunSearch, path, pat, useMask, icase, exts).detach();
+            std::thread(RunSearch, path, pat, useMask, icase).detach();
         }
         return 0;
     }
 
     case WM_CLOSE:
-        // Если поиск идёт — просим остановиться и ждём
         if (g_running) {
             int ans = MessageBoxW(hwnd,
                 L"Поиск ещё идёт. Прервать и закрыть?",
                 L"Подтверждение", MB_ICONQUESTION | MB_YESNO);
             if (ans != IDYES) return 0;
             g_stop = true;
-            // дать потоку время аккуратно выйти
             for (int i = 0; i < 50 && g_running; ++i) Sleep(100);
         }
         SaveSettings();
@@ -585,7 +1059,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
 
     HWND hwnd = CreateWindowW(cls, L"Finder — поиск по файлам",
                               WS_OVERLAPPEDWINDOW,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 730, 620,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 730, 580,
                               nullptr, nullptr, hInst, nullptr);
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
