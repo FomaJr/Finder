@@ -40,14 +40,15 @@ namespace fs = std::filesystem;
 #define ID_CHK_MASK      104
 #define ID_CHK_ICASE     105
 #define ID_BTN_SEARCH    106
-#define ID_EDIT_RESULTS  107
+#define ID_LIST_RESULTS  107
 #define ID_BTN_CLEAR     108
 #define ID_BTN_SAVE      109
 #define ID_PROGRESS      110
 #define ID_STATUS        111
+#define ID_TOOLTIP       112
 
 static HWND hPath, hBrowse, hPattern, hMask, hIcase,
-            hSearch, hResults, hClear, hSave, hProgress, hStatus;
+            hSearch, hResults, hClear, hSave, hProgress, hStatus, hTooltip;
 static HFONT g_font;
 static std::atomic<bool> g_running{false};
 static std::atomic<bool> g_stop{false};
@@ -76,15 +77,15 @@ static bool isZipOffice(const std::string& ext) {
         || ext == ".odt"  || ext == ".ods"  || ext == ".odp";
 }
 
-// ---------- Результаты ----------
-struct ResultLine {
-    int lineIndex;
+// ---------- Хранилище результатов (для двойного клика) ----------
+struct ResultRow {
     std::wstring filePath;
     int fileLine;
+    std::wstring lineText;
 };
-static std::vector<ResultLine> g_resultLines;
-static std::mutex g_resultMutex;
-static std::mutex g_appendMutex;
+static std::vector<ResultRow> g_rows;
+static std::mutex g_rowsMutex;
+static std::mutex g_listMutex;
 
 // ==================== Утилиты путей ====================
 
@@ -418,7 +419,6 @@ static bool ExtractPdfTextFallback(const fs::path& path, std::string& out) {
     return !out.empty();
 }
 
-// Запуск pdftotext.exe с перехватом stdout
 static bool RunPdftotext(const fs::path& pdftotextExe,
                          const fs::path& pdfPath,
                          std::string& out)
@@ -521,16 +521,41 @@ static void SaveSettings() {
         SendMessageW(hIcase, BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0", ini.c_str());
 }
 
+// Возвращает домашнюю папку пользователя (C:\Users\<имя>)
+static std::wstring GetHomeDir() {
+    wchar_t buf[MAX_PATH] = {};
+    DWORD n = GetEnvironmentVariableW(L"USERPROFILE", buf, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) return buf;
+    // fallback
+    return L"C:\\";
+}
+
 static void LoadSettings() {
     std::wstring ini = GetIniPath();
+    std::wstring defaultPath = GetHomeDir();
+
+    // Проверяем, существует ли указанный путь
+    auto pathExists = [](const std::wstring& p) -> bool {
+        if (p.empty()) return false;
+        DWORD attr = GetFileAttributesW(p.c_str());
+        return attr != INVALID_FILE_ATTRIBUTES;
+    };
+
     if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        SetWindowTextW(hPath, L"G:\\PAN\\Finder\\Finder");
+        SetWindowTextW(hPath, defaultPath.c_str());
         return;
     }
     wchar_t buf[1024];
-    GetPrivateProfileStringW(L"general", L"path", L"G:\\PAN\\Finder\\Finder",
+    GetPrivateProfileStringW(L"general", L"path", defaultPath.c_str(),
                              buf, 1024, ini.c_str());
-    SetWindowTextW(hPath, buf);
+
+    // Если сохранённый путь не существует — используем домашнюю
+    if (!pathExists(buf)) {
+        SetWindowTextW(hPath, defaultPath.c_str());
+    } else {
+        SetWindowTextW(hPath, buf);
+    }
+
     GetPrivateProfileStringW(L"general", L"pattern", L"", buf, 1024, ini.c_str());
     SetWindowTextW(hPattern, buf);
     int m = GetPrivateProfileIntW(L"general", L"mask", 0, ini.c_str());
@@ -627,36 +652,50 @@ static std::wstring GetText(HWND h) {
     return s;
 }
 
-// ==================== Вывод результатов ====================
+// ==================== ListView helpers ====================
 
-static void AppendResults(const std::wstring& text) {
-    std::lock_guard<std::mutex> lk(g_appendMutex);
-    int len = GetWindowTextLengthW(hResults);
-    SendMessageW(hResults, EM_SETSEL, len, len);
-    SendMessageW(hResults, EM_REPLACESEL, FALSE, (LPARAM)text.c_str());
+// Добавить строку результатов в ListView (безопасно из любого потока)
+static void AppendResultRow(const std::wstring& filePath, int fileLine,
+                            const std::wstring& lineText)
+{
+    std::lock_guard<std::mutex> lk(g_listMutex);
+
+    int idx = ListView_GetItemCount(hResults);
+    LVITEMW item = {};
+    item.mask = LVIF_TEXT | LVIF_PARAM;
+    item.iItem = idx;
+    item.iSubItem = 0;
+    item.pszText = (LPWSTR)filePath.c_str();
+    item.lParam = (LPARAM)idx;  // индекс в g_rows
+
+    int actual = (int)SendMessageW(hResults, LVM_INSERTITEMW, 0, (LPARAM)&item);
+    if (actual == -1) return;
+
+    ListView_SetItemText(hResults, actual, 1, (LPWSTR)std::to_wstring(fileLine).c_str());
+    ListView_SetItemText(hResults, actual, 2, (LPWSTR)lineText.c_str());
+
+    // Прокрутка вниз
+    SendMessageW(hResults, LVM_ENSUREVISIBLE, actual, FALSE);
+
+    // Сохраняем данные для двойного клика
+    {
+        std::lock_guard<std::mutex> lk2(g_rowsMutex);
+        ResultRow r;
+        r.filePath = filePath;
+        r.fileLine = fileLine;
+        r.lineText = lineText;
+        g_rows.push_back(r);
+    }
 }
 
-static void AppendResultFileLine(const std::wstring& filePath, int fileLine,
-                                 const std::wstring& lineText)
-{
-    std::lock_guard<std::mutex> lk(g_appendMutex);
-    int len = GetWindowTextLengthW(hResults);
-    int lineIndex = (int)SendMessageW(hResults, EM_LINEFROMCHAR, (WPARAM)len, 0);
-
-    std::wstring toAdd;
-    if (len > 0) toAdd += L"\r\n";
-    toAdd += std::to_wstring(fileLine) + L": " + lineText;
-
-    SendMessageW(hResults, EM_SETSEL, len, len);
-    SendMessageW(hResults, EM_REPLACESEL, FALSE, (LPARAM)toAdd.c_str());
-
-    ResultLine rl;
-    rl.lineIndex = lineIndex;
-    rl.filePath  = filePath;
-    rl.fileLine  = fileLine;
+static void ClearResults() {
     {
-        std::lock_guard<std::mutex> lk2(g_resultMutex);
-        g_resultLines.push_back(rl);
+        std::lock_guard<std::mutex> lk(g_listMutex);
+        ListView_DeleteAllItems(hResults);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_rowsMutex);
+        g_rows.clear();
     }
 }
 
@@ -671,7 +710,7 @@ static void SearchInText(const std::string& content,
                          const std::string& pattern,
                          const std::string& reStr,
                          bool useMask, bool icase,
-                         bool& headerPrinted, int& matchedThisFile)
+                         int& matchedThisFile)
 {
     std::istringstream iss(content);
     std::string line;
@@ -683,12 +722,8 @@ static void SearchInText(const std::string& content,
         bool hit = useMask ? matchesMask(line, reStr, icase)
                            : contains(line, pattern, icase);
         if (hit) {
-            if (!headerPrinted) {
-                AppendResults(L"\r\n=== " + fname + L" ===\r\n");
-                headerPrinted = true;
-                matchedThisFile = 1;
-            }
-            AppendResultFileLine(fname, lineno, Utf8ToWide(line));
+            AppendResultRow(fname, lineno, Utf8ToWide(line));
+            matchedThisFile = 1;
         }
     }
 }
@@ -715,11 +750,6 @@ static void RunSearch(std::wstring wpath, std::wstring wpattern,
     int matchedFiles = 0;
     int current = 0;
 
-    {
-        std::lock_guard<std::mutex> lk(g_resultMutex);
-        g_resultLines.clear();
-    }
-
     for (const auto& f : files) {
         if (g_stop) break;
         ++current;
@@ -740,18 +770,15 @@ static void RunSearch(std::wstring wpath, std::wstring wpattern,
         if (content.empty()) continue;
 
         std::wstring fname = Utf8ToWide(PathToUtf8(f));
-        bool headerPrinted = false;
         int matchedThisFile = 0;
 
         SearchInText(content, fname, pattern, reStr,
-                     useMask, icase, headerPrinted, matchedThisFile);
+                     useMask, icase, matchedThisFile);
 
         if (matchedThisFile) ++matchedFiles;
     }
 
     PostMessageW(hProgress, PBM_SETPOS, (int)files.size(), 0);
-    AppendResults(L"\r\nФайлов с совпадениями: " +
-                  std::to_wstring(matchedFiles) + L"\r\n");
     UpdateStatus(L"Готово. Найдено файлов: " + std::to_wstring(matchedFiles));
 
     g_running = false;
@@ -761,8 +788,8 @@ static void RunSearch(std::wstring wpath, std::wstring wpattern,
 // ==================== Сохранить результаты ====================
 
 static void SaveResultsToFile(HWND hwnd) {
-    int len = GetWindowTextLengthW(hResults);
-    if (len == 0) {
+    int count = ListView_GetItemCount(hResults);
+    if (count == 0) {
         MessageBoxW(hwnd, L"Результатов нет.", L"Сохранить", MB_ICONINFORMATION);
         return;
     }
@@ -777,49 +804,41 @@ static void SaveResultsToFile(HWND hwnd) {
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     if (!GetSaveFileNameW(&ofn)) return;
 
-    std::wstring content(len + 1, L'\0');
-    GetWindowTextW(hResults, content.data(), len + 1);
-    content.resize(len);
-
     std::ofstream out(fs::path(file), std::ios::binary);
     if (!out) {
         MessageBoxW(hwnd, L"Не удалось сохранить файл.", L"Ошибка", MB_ICONERROR);
         return;
     }
-    std::string utf8 = WideToUtf8(content);
-    out.write("\xEF\xBB\xBF", 3);
-    out.write(utf8.data(), (std::streamsize)utf8.size());
+    out.write("\xEF\xBB\xBF", 3);  // UTF-8 BOM
+
+    std::lock_guard<std::mutex> lk(g_rowsMutex);
+    for (const auto& r : g_rows) {
+        std::string utf8 = WideToUtf8(r.filePath + L":" +
+                                      std::to_wstring(r.fileLine) + L": " +
+                                      r.lineText) + "\r\n";
+        out.write(utf8.data(), (std::streamsize)utf8.size());
+    }
+    out.close();
     MessageBoxW(hwnd, L"Сохранено.", L"OK", MB_ICONINFORMATION);
 }
 
-// ==================== Открыть файл по двойному клику ====================
+// ==================== Открыть файл ====================
 
-static void OpenResultLine(HWND hwnd) {
-    DWORD sel = (DWORD)SendMessageW(hResults, EM_GETSEL, 0, 0);
-    int clickedLine = (int)SendMessageW(hResults, EM_LINEFROMCHAR,
-                                        (WPARAM)LOWORD(sel), 0);
-    std::wstring filePath;
-    int fileLine = 0;
+static void OpenRow(int rowIndex) {
+    ResultRow r;
     {
-        std::lock_guard<std::mutex> lk(g_resultMutex);
-        for (const auto& rl : g_resultLines) {
-            if (rl.lineIndex <= clickedLine) {
-                filePath = rl.filePath;
-                fileLine = rl.fileLine;
-            } else break;
-        }
+        std::lock_guard<std::mutex> lk(g_rowsMutex);
+        if (rowIndex < 0 || rowIndex >= (int)g_rows.size()) return;
+        r = g_rows[rowIndex];
     }
-    if (filePath.empty()) return;
 
-    // Определяем расширение (в нижнем регистре)
     std::wstring ext;
-    size_t dot = filePath.find_last_of(L'.');
+    size_t dot = r.filePath.find_last_of(L'.');
     if (dot != std::wstring::npos) {
-        ext = filePath.substr(dot);
+        ext = r.filePath.substr(dot);
         for (auto& c : ext) c = (wchar_t)towlower(c);
     }
 
-    // Документы — открываем ассоциированным приложением
     bool isDocument =
         ext == L".docx" || ext == L".doc"  || ext == L".rtf" ||
         ext == L".odt"  || ext == L".xlsx" || ext == L".xls" ||
@@ -827,13 +846,12 @@ static void OpenResultLine(HWND hwnd) {
         ext == L".odp"  || ext == L".pdf";
 
     if (isDocument) {
-        ShellExecuteW(nullptr, L"open", filePath.c_str(),
+        ShellExecuteW(nullptr, L"open", r.filePath.c_str(),
                       nullptr, nullptr, SW_SHOWNORMAL);
         return;
     }
 
-    // Текстовые — всегда Блокнот
-    std::wstring cmd = L"notepad.exe \"" + filePath + L"\"";
+    std::wstring cmd = L"notepad.exe \"" + r.filePath + L"\"";
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
     std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
@@ -845,41 +863,45 @@ static void OpenResultLine(HWND hwnd) {
     }
 }
 
+static int GetSelectedRow() {
+    return ListView_GetNextItem(hResults, -1, LVNI_SELECTED);
+}
+
 // ==================== Контекстное меню ====================
 
 static void ShowResultsContextMenu(HWND hwnd, int x, int y) {
+    int sel = GetSelectedRow();
     HMENU hMenu = CreatePopupMenu();
-    AppendMenuW(hMenu, MF_STRING, 1, L"Копировать");
+    AppendMenuW(hMenu, MF_STRING, 1, L"Копировать путь");
     AppendMenuW(hMenu, MF_STRING, 2, L"Открыть файл");
+    if (sel < 0) {
+        EnableMenuItem(hMenu, 1, MF_GRAYED);
+        EnableMenuItem(hMenu, 2, MF_GRAYED);
+    }
     int cmd = (int)TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                   x, y, 0, hwnd, nullptr);
     DestroyMenu(hMenu);
-    if (cmd == 1) SendMessageW(hResults, WM_COPY, 0, 0);
-    else if (cmd == 2) OpenResultLine(hwnd);
-}
 
-// ==================== Подкласс поля результатов ====================
-
-static LRESULT CALLBACK ResultsSubclassProc(HWND hwnd, UINT msg,
-                                            WPARAM wp, LPARAM lp,
-                                            UINT_PTR /*id*/, DWORD_PTR /*ref*/)
-{
-    if (msg == WM_LBUTTONDBLCLK) {
-        OpenResultLine(GetParent(hwnd));
-        return 0;
-    }
-    if (msg == WM_CONTEXTMENU) {
-        int x = GET_X_LPARAM(lp);
-        int y = GET_Y_LPARAM(lp);
-        if (x == -1 && y == -1) {
-            POINT pt;
-            GetCursorPos(&pt);
-            x = pt.x; y = pt.y;
+    if (cmd == 1 && sel >= 0) {
+        std::lock_guard<std::mutex> lk(g_rowsMutex);
+        if (sel < (int)g_rows.size()) {
+            std::wstring text = g_rows[sel].filePath + L":" +
+                                std::to_wstring(g_rows[sel].fileLine);
+            if (OpenClipboard(hwnd)) {
+                EmptyClipboard();
+                size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+                HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+                if (h) {
+                    memcpy(GlobalLock(h), text.c_str(), bytes);
+                    GlobalUnlock(h);
+                    SetClipboardData(CF_UNICODETEXT, h);
+                }
+                CloseClipboard();
+            }
         }
-        ShowResultsContextMenu(GetParent(hwnd), x, y);
-        return 0;
+    } else if (cmd == 2 && sel >= 0) {
+        OpenRow(sel);
     }
-    return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
 // ==================== Окно ====================
@@ -931,13 +953,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                       WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 160, 670, 20,
                       hwnd, (HMENU)ID_STATUS, nullptr, nullptr);
 
-        hResults = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                      WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
-                      ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+        // ListView с колонками
+        hResults = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                      WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS |
+                      LVS_SINGLESEL,
                       10, 184, 670, 300,
-                      hwnd, (HMENU)ID_EDIT_RESULTS, nullptr, nullptr);
+                      hwnd, (HMENU)ID_LIST_RESULTS, nullptr, nullptr);
 
-        SetWindowSubclass(hResults, ResultsSubclassProc, 1, 0);
+        ListView_SetExtendedListViewStyle(hResults,
+            LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER |
+            LVS_EX_INFOTIP);
+
+        // Колонки: Файл, Стр., Текст
+        LVCOLUMNW col = {};
+        col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+
+        col.iSubItem = 0;
+        col.pszText = (LPWSTR)L"Файл";
+        col.cx = 300;
+        ListView_InsertColumn(hResults, 0, &col);
+
+        col.iSubItem = 1;
+        col.pszText = (LPWSTR)L"Стр.";
+        col.cx = 50;
+        ListView_InsertColumn(hResults, 1, &col);
+
+        col.iSubItem = 2;
+        col.pszText = (LPWSTR)L"Текст";
+        col.cx = 320;
+        ListView_InsertColumn(hResults, 2, &col);
 
         EnumChildWindows(hwnd, [](HWND h, LPARAM p) -> BOOL {
             SendMessageW(h, WM_SETFONT, (WPARAM)p, TRUE);
@@ -955,6 +999,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         MoveWindow(hProgress, 10, 138, w - 20, 18, TRUE);
         MoveWindow(hStatus,   10, 160, w - 20, 20, TRUE);
         MoveWindow(hResults,  10, 184, w - 20, h - 194, TRUE);
+
+        // Растягиваем колонку «Текст» на всё оставшееся место
+        int listW = w - 20;
+        int col0 = 300;
+        int col1 = 50;
+        int col2 = listW - col0 - col1 - 4;
+        if (col2 < 100) col2 = 100;
+        ListView_SetColumnWidth(hResults, 0, col0);
+        ListView_SetColumnWidth(hResults, 1, col1);
+        ListView_SetColumnWidth(hResults, 2, col2);
         return 0;
     }
 
@@ -964,10 +1018,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
     }
 
+    case WM_NOTIFY: {
+        LPNMHDR nh = (LPNMHDR)lp;
+        if (nh->idFrom == ID_LIST_RESULTS) {
+            if (nh->code == NM_DBLCLK) {
+                int sel = GetSelectedRow();
+                if (sel >= 0) OpenRow(sel);
+                return 0;
+            }
+            if (nh->code == NM_RCLICK) {
+                POINT pt;
+                GetCursorPos(&pt);
+                ShowResultsContextMenu(hwnd, pt.x, pt.y);
+                return 0;
+            }
+            if (nh->code == LVN_KEYDOWN) {
+                LPNMLVKEYDOWN kd = (LPNMLVKEYDOWN)lp;
+                if (kd->wVKey == VK_RETURN) {
+                    int sel = GetSelectedRow();
+                    if (sel >= 0) OpenRow(sel);
+                    return 0;
+                }
+            }
+        }
+        break;
+    }
+
     case WM_COMMAND: {
         int id = LOWORD(wp);
-        int code = HIWORD(wp);
-        if (id == ID_EDIT_RESULTS && code == EN_ERRSPACE) return 0;
 
         if (id == ID_BTN_BROWSE) {
             BROWSEINFOW bi = {};
@@ -983,11 +1061,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         else if (id == ID_BTN_CLEAR) {
-            SetWindowTextW(hResults, L"");
-            {
-                std::lock_guard<std::mutex> lk(g_resultMutex);
-                g_resultLines.clear();
-            }
+            ClearResults();
             UpdateStatus(L"Готов.");
         }
         else if (id == ID_BTN_SAVE) {
@@ -1005,12 +1079,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             bool useMask = SendMessageW(hMask, BM_GETCHECK, 0, 0) == BST_CHECKED;
             bool icase   = SendMessageW(hIcase, BM_GETCHECK, 0, 0) == BST_CHECKED;
 
-            SetWindowTextW(hResults, L"");
-            {
-                std::lock_guard<std::mutex> lk(g_resultMutex);
-                g_resultLines.clear();
-            }
-            AppendResults(L"Поиск...\r\n");
+            ClearResults();
             UpdateStatus(L"Поиск...");
 
             g_running = true;
@@ -1044,7 +1113,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
-    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS };
+    INITCOMMONCONTROLSEX icc = {};
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS | ICC_LISTVIEW_CLASSES;
     InitCommonControlsEx(&icc);
 
     const wchar_t* cls = L"FinderGuiClass";
@@ -1059,7 +1130,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
 
     HWND hwnd = CreateWindowW(cls, L"Finder — поиск по файлам",
                               WS_OVERLAPPEDWINDOW,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 730, 580,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 740, 600,
                               nullptr, nullptr, hInst, nullptr);
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
