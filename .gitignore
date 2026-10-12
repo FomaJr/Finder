@@ -1,0 +1,19 @@
+Finder.exe
+*.o
+*.pdb
+*.res
+build/
+# Visual Studio
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+x64/
+Debug/
+Release/
+*.pdb
+*.ilk
+*.idb
+*.tlog
+*.log
+*.obj
