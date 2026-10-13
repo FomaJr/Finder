@@ -1,8 +1,7 @@
 ﻿// Finder.cpp
-// Сборка (MinGW):
+
 //   g++ -std=c++17 -O2 -static -s -mwindows -municode Finder.cpp -o Finder.exe -lcomctl32 -lole32 -lshell32 -lz
-//
-// Рядом с Finder.exe должен лежать pdftotext.exe (Poppler) для поиска в PDF.
+
 
 #ifndef UNICODE
 #define UNICODE
@@ -45,17 +44,15 @@ namespace fs = std::filesystem;
 #define ID_BTN_SAVE      109
 #define ID_PROGRESS      110
 #define ID_STATUS        111
-#define ID_TOOLTIP       112
 
 static HWND hPath, hBrowse, hPattern, hMask, hIcase,
-            hSearch, hResults, hClear, hSave, hProgress, hStatus, hTooltip;
+            hSearch, hResults, hClear, hSave, hProgress, hStatus;
 static HFONT g_font;
 static std::atomic<bool> g_running{false};
 static std::atomic<bool> g_stop{false};
 
 static const uint64_t kMaxFileSize = 200ull * 1024 * 1024;
 
-// ---------- Расширения ----------
 static const std::vector<std::string> kExtensions = {
     ".txt", ".log", ".md", ".ini", ".cfg", ".conf", ".json", ".xml",
     ".yml", ".yaml", ".csv", ".tsv", ".tex", ".rtf",
@@ -77,7 +74,6 @@ static bool isZipOffice(const std::string& ext) {
         || ext == ".odt"  || ext == ".ods"  || ext == ".odp";
 }
 
-// ---------- Хранилище результатов (для двойного клика) ----------
 struct ResultRow {
     std::wstring filePath;
     int fileLine;
@@ -86,8 +82,6 @@ struct ResultRow {
 static std::vector<ResultRow> g_rows;
 static std::mutex g_rowsMutex;
 static std::mutex g_listMutex;
-
-// ==================== Утилиты путей ====================
 
 static std::string PathToUtf8(const fs::path& p) {
     auto u8 = p.u8string();
@@ -100,12 +94,11 @@ static fs::path ExeDir() {
     return fs::path(buf).parent_path();
 }
 
-// ==================== ZIP ====================
-
 static uint32_t ReadU32(const uint8_t* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
          | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
+
 static uint16_t ReadU16(const uint8_t* p) {
     return (uint16_t)(p[0] | (p[1] << 8));
 }
@@ -201,8 +194,6 @@ static bool ZipExtract(const fs::path& zipPath, const std::string& wantName,
     return false;
 }
 
-// ==================== XML -> plain text ====================
-
 static void DecodeXmlEntities(std::string& s) {
     struct { const char* from; const char* to; } map[] = {
         {"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"},
@@ -266,8 +257,6 @@ static std::string XmlToText(const std::string& xml) {
     return s;
 }
 
-// ==================== DOCX / XLSX / PPTX / ODT ====================
-
 static bool ExtractOfficeText(const fs::path& path, const std::string& ext,
                               std::string& out)
 {
@@ -316,8 +305,6 @@ static bool ExtractOfficeText(const fs::path& path, const std::string& ext,
     }
     return false;
 }
-
-// ==================== PDF ====================
 
 static std::string ExtractTextFromContentStream(const std::string& content) {
     std::string out;
@@ -478,8 +465,6 @@ static bool ExtractPdfText(const fs::path& path, std::string& out) {
     return ExtractPdfTextFallback(path, out);
 }
 
-// ==================== Общая точка извлечения ====================
-
 static std::string ExtractFileText(const fs::path& path,
                                    const std::string& extLower)
 {
@@ -497,8 +482,6 @@ static std::string ExtractFileText(const fs::path& path,
     if (!ReadFileAll(path, data)) return "";
     return data;
 }
-
-// ==================== Настройки ====================
 
 static std::wstring GetIniPath() {
     wchar_t buf[MAX_PATH];
@@ -521,12 +504,10 @@ static void SaveSettings() {
         SendMessageW(hIcase, BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0", ini.c_str());
 }
 
-// Возвращает домашнюю папку пользователя (C:\Users\<имя>)
 static std::wstring GetHomeDir() {
     wchar_t buf[MAX_PATH] = {};
     DWORD n = GetEnvironmentVariableW(L"USERPROFILE", buf, MAX_PATH);
     if (n > 0 && n < MAX_PATH) return buf;
-    // fallback
     return L"C:\\";
 }
 
@@ -534,7 +515,6 @@ static void LoadSettings() {
     std::wstring ini = GetIniPath();
     std::wstring defaultPath = GetHomeDir();
 
-    // Проверяем, существует ли указанный путь
     auto pathExists = [](const std::wstring& p) -> bool {
         if (p.empty()) return false;
         DWORD attr = GetFileAttributesW(p.c_str());
@@ -548,8 +528,6 @@ static void LoadSettings() {
     wchar_t buf[1024];
     GetPrivateProfileStringW(L"general", L"path", defaultPath.c_str(),
                              buf, 1024, ini.c_str());
-
-    // Если сохранённый путь не существует — используем домашнюю
     if (!pathExists(buf)) {
         SetWindowTextW(hPath, defaultPath.c_str());
     } else {
@@ -563,8 +541,6 @@ static void LoadSettings() {
     int ic = GetPrivateProfileIntW(L"general", L"icase", 0, ini.c_str());
     SendMessageW(hIcase, BM_SETCHECK, ic ? BST_CHECKED : BST_UNCHECKED, 0);
 }
-
-// ==================== Утилиты ====================
 
 static std::string toLower(std::string s) {
     for (auto& c : s) c = (char)std::tolower((unsigned char)c);
@@ -625,8 +601,6 @@ static std::vector<fs::path> collectFiles(const fs::path& root) {
     return out;
 }
 
-// ==================== UTF-8 <-> wide ====================
-
 static std::wstring Utf8ToWide(const std::string& s) {
     if (s.empty()) return L"";
     int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
@@ -652,9 +626,6 @@ static std::wstring GetText(HWND h) {
     return s;
 }
 
-// ==================== ListView helpers ====================
-
-// Добавить строку результатов в ListView (безопасно из любого потока)
 static void AppendResultRow(const std::wstring& filePath, int fileLine,
                             const std::wstring& lineText)
 {
@@ -666,7 +637,7 @@ static void AppendResultRow(const std::wstring& filePath, int fileLine,
     item.iItem = idx;
     item.iSubItem = 0;
     item.pszText = (LPWSTR)filePath.c_str();
-    item.lParam = (LPARAM)idx;  // индекс в g_rows
+    item.lParam = (LPARAM)idx;
 
     int actual = (int)SendMessageW(hResults, LVM_INSERTITEMW, 0, (LPARAM)&item);
     if (actual == -1) return;
@@ -674,10 +645,8 @@ static void AppendResultRow(const std::wstring& filePath, int fileLine,
     ListView_SetItemText(hResults, actual, 1, (LPWSTR)std::to_wstring(fileLine).c_str());
     ListView_SetItemText(hResults, actual, 2, (LPWSTR)lineText.c_str());
 
-    // Прокрутка вниз
     SendMessageW(hResults, LVM_ENSUREVISIBLE, actual, FALSE);
 
-    // Сохраняем данные для двойного клика
     {
         std::lock_guard<std::mutex> lk2(g_rowsMutex);
         ResultRow r;
@@ -702,8 +671,6 @@ static void ClearResults() {
 static void UpdateStatus(const std::wstring& s) {
     SetWindowTextW(hStatus, s.c_str());
 }
-
-// ==================== Фоновый поиск ====================
 
 static void SearchInText(const std::string& content,
                          const std::wstring& fname,
@@ -785,8 +752,6 @@ static void RunSearch(std::wstring wpath, std::wstring wpattern,
     EnableWindow(hSearch, TRUE);
 }
 
-// ==================== Сохранить результаты ====================
-
 static void SaveResultsToFile(HWND hwnd) {
     int count = ListView_GetItemCount(hResults);
     if (count == 0) {
@@ -809,7 +774,7 @@ static void SaveResultsToFile(HWND hwnd) {
         MessageBoxW(hwnd, L"Не удалось сохранить файл.", L"Ошибка", MB_ICONERROR);
         return;
     }
-    out.write("\xEF\xBB\xBF", 3);  // UTF-8 BOM
+    out.write("\xEF\xBB\xBF", 3);
 
     std::lock_guard<std::mutex> lk(g_rowsMutex);
     for (const auto& r : g_rows) {
@@ -821,8 +786,6 @@ static void SaveResultsToFile(HWND hwnd) {
     out.close();
     MessageBoxW(hwnd, L"Сохранено.", L"OK", MB_ICONINFORMATION);
 }
-
-// ==================== Открыть файл ====================
 
 static void OpenRow(int rowIndex) {
     ResultRow r;
@@ -867,8 +830,6 @@ static int GetSelectedRow() {
     return ListView_GetNextItem(hResults, -1, LVNI_SELECTED);
 }
 
-// ==================== Контекстное меню ====================
-
 static void ShowResultsContextMenu(HWND hwnd, int x, int y) {
     int sel = GetSelectedRow();
     HMENU hMenu = CreatePopupMenu();
@@ -903,8 +864,6 @@ static void ShowResultsContextMenu(HWND hwnd, int x, int y) {
         OpenRow(sel);
     }
 }
-
-// ==================== Окно ====================
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -953,7 +912,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                       WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 160, 670, 20,
                       hwnd, (HMENU)ID_STATUS, nullptr, nullptr);
 
-        // ListView с колонками
         hResults = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                       WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS |
                       LVS_SINGLESEL,
@@ -964,7 +922,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER |
             LVS_EX_INFOTIP);
 
-        // Колонки: Файл, Стр., Текст
         LVCOLUMNW col = {};
         col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
 
@@ -1000,7 +957,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         MoveWindow(hStatus,   10, 160, w - 20, 20, TRUE);
         MoveWindow(hResults,  10, 184, w - 20, h - 194, TRUE);
 
-        // Растягиваем колонку «Текст» на всё оставшееся место
         int listW = w - 20;
         int col0 = 300;
         int col1 = 50;
